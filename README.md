@@ -6,7 +6,6 @@
 makedeb takes PKGBUILD files and creates Debian packages installable with APT
 
 ## Options:
-
   -A, --ignore-arch        Ignore errors about mismatching architectures
   -d, --nodeps             Skip all dependency checks
   -F, --file, -p           Specify a build file other than 'PKGBUILD'
@@ -23,3 +22,4 @@ makedeb takes PKGBUILD files and creates Debian packages installable with APT
 The following options can be passed to makepkg:
   --printsrcinfo           Print a generated .SRCINFO file and exit
   --skippgpcheck           Do not verify source files against PGP signatures
+
