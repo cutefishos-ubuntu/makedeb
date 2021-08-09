@@ -1,0 +1,810 @@
+#!/usr/bin/env bash
+pkgbuild_check() {
+
+    for i in pkgname pkgver pkgrel; do
+        if [[ "$(eval echo \${${i}})" == "" ]]; then
+            error "${i} isn't set"
+            bad_build_file="true"
+        fi
+    done
+
+    if [[ "${control_fields}" != "" ]]; then
+        export build_file_control_fields="true"
+
+        if ! declare -p control_fields 2> /dev/null | grep -q '^declare \-a'; then
+            error 'control_fields should be an array'
+            bad_build_file="true"
+        fi
+    fi
+
+    if [[ "${bad_build_file}" == "true" ]]; then
+        exit 1
+    fi
+}
+check_distro_dependencies() {
+    msg "Setting distro-specific relationships..."
+    export distro_version="$(lsb_release -cs)"
+
+    for i in depends optdepends conflicts provides replaces makedepends optdepends; do
+        package_data="$(eval echo \${${distro_version}_${i}[@]})"
+
+        if [[ "${package_data}" != "" ]]; then
+            msg2 "Setting \$${i} to ${package_data}..."
+            unset "${i}"
+            export "${i}"="${package_data}"
+
+            unset package_data
+        fi
+    done
+}
+arg_check() {
+    eval set -- ${argument_list[@]@Q}
+
+    # Actual argument check
+    if [[ "${target_os}" == "debian" ]]; then
+        while [[ "${1}" != "" ]]; do
+            case "${1}" in
+				-A | --ignore-arch)        export makepkg_options+=" --ignorearch" ;;
+                -d | --nodeps)             export skip_dependency_checks="true"; export makepkg_options+=" --nodeps" ;;
+                -F | -p | --file)          export FILE="${2}"; shift ;;
+                -h | --help)               help; exit 0 ;;
+                -H | --field)              export extra_control_fields+=("${2}"); shift ;;
+                -i | --install)            export INSTALL="TRUE" ;;
+                -Q | --no-fields)          export skip_pkgbuild_fields="true" ;;
+				-r | --rmdeps)             export remove_dependencies="true"; export makepkg_options+=" --rmdeps" ;;
+                -s | --syncdeps)           export install_dependencies="true"; export makepkg_options+=" --syncdeps" ;;
+                -v | --distro-packages)    export distro_packages="true" ;;
+                -V | --version)            version_info; exit 0 ;;
+                --dur-check)               export dur_check="true" ;;
+                --verbose)                 set -x ;;
+
+                --printsrcinfo)            export makepkg_printsrcinfo="true" ;;
+                --skippgpcheck)            export makepkg_options+=" --skippgpcheck" ;;
+
+                -*)                        error "Unknown option '${1}'"; exit 1 ;;
+                "")                        break ;;
+            esac
+            shift 1 || true
+        done
+
+    elif [[ "${target_os}" == "arch" ]]; then
+        while [[ "${1}" != "" ]]; do
+            case "${1}" in
+				-A | --ignore-arch)        export makepkg_options+=" --ignorearch" ;;
+                -F | -p | --file)          export FILE="${2}"; shift ;;
+                -h | --help)               help; exit 0 ;;
+                -Q | --no-fields)          export skip_pkgbuild_fields="true" ;;
+                -V | --version)            version_info; exit 0 ;;
+                --dur-check)               export dur_check="true" ;;
+                --verbose)                 set -x ;;
+
+                -d | --nodeps)             export skip_dependency_checks="true"; export makepkg_options+=" --nodeps" ;;
+				-r | --rmdeps)             export remove_dependencies="true"; export makepkg_options+=" --rmdeps" ;;
+                -s | --syncdeps)           export install_dependencies="true"; export makepkg_options+=" --syncdeps" ;;
+                --printsrcinfo)            export makepkg_printsrcinfo="true" ;;
+                --skippgpcheck)            export makepkg_options+=" --skippgpcheck" ;;
+
+                -*)                        error "Unknown option '${1}'"; exit 1 ;;
+                "")                        break ;;
+            esac
+            shift 1 || true
+        done
+    fi
+
+    if [[ "${makepkg_printsrcinfo}" == "true" ]]; then makepkg --printsrcinfo -p "${FILE:-PKGBUILD}"; exit ${?}; fi
+    if [[ "${dur_check}" == "true" ]]; then dur_check; exit 0; fi
+
+    # Argument checks to make sure we didn't request something impossible
+    if [[ "${skip_dependency_checks}" == "true" && "${install_dependencies}" == "true" ]]; then
+      error "Option '--nodeps' cannot be used with '--syncdeps'."
+      error "Aborting..."
+      exit 1
+    fi
+}
+add_install_scripts() {
+    if ! [[ -f ".INSTALL" ]]; then
+        return 0
+    fi
+
+    msg2 "Converting installation scripts..."
+    source .INSTALL
+
+    for i in pre_install post_install pre_remove post_remove; do
+
+        if [[ "$(type -t "${i}")" != "function" ]]; then
+            continue
+        fi
+
+        function_data="$(type "${i}" | sed '1,3d' | sed '$d')"
+
+        output_filename="$(echo "${i}" | sed 's|_install|inst|' | sed 's|_remove|rm|')"
+
+        echo '#!/usr/bin/env bash' > "DEBIAN/${output_filename}"
+        echo "${function_data}" >> "DEBIAN/${output_filename}"
+        chmod 555 "DEBIAN/${output_filename}"
+    done
+}
+export_control() {
+  if [[ ${@: 2} != "" ]]; then
+    echo "${1} ${@: 2}" >> "${pkgdir}"/"${package}"/DEBIAN/control
+  fi
+}
+install_depends() {
+    if [[ "${1}" != "" ]]; then
+        msg "Checking build dependencies..."
+
+        local apt_output=$(eval apt-get satisfy -sq ${@} 2>&1)
+        local apt_uninstallable_packages="$(echo "${apt_output}" | \
+                                            grep -o 'Depends: .*' | \
+                                            sed 's|.*Depends: ||g' | \
+                                            sed 's| but [^ ]* is to be installed||g' | \
+                                            sed 's|$|,|g' | \
+                                            xargs |
+                                            head -c -2)" || true
+
+        if [[ "${apt_uninstallable_packages}" != "" ]]; then
+            error "The following build dependencies are unable to be installed: ${apt_uninstallable_packages}"
+            exit 1
+        fi
+
+        apt_package_dependencies="$(echo "${apt_output}" |
+                                    sed 's|$| |g' |
+                                    tr -d '\n' |
+                                    grep -o 'The following NEW packages will be installed:.*[[:digit:]] upgraded' |
+                                    sed 's|The following NEW packages will be installed:||' |
+                                    sed 's|[[:digit:]] upgraded||' |
+                                    xargs)" || true
+
+        if [[ "${apt_package_dependencies}" != "" ]]; then
+            msg "Installing build dependencies..."
+            sudo apt install ${apt_package_dependencies}
+
+            if [[ "${?}" != "0" ]]; then
+                error "Couldn't install build dependencies. Aborting..."
+                exit 1
+            fi
+
+        fi
+
+    fi
+}
+version_info() {
+    makepkg_package_version="$(makepkg --version | awk NR=="1" | awk '{print $3}')"
+
+    echo "makedeb (${makedeb_package_version}) - ${makedeb_release_type^} Release"
+    echo "makepkg (${makepkg_package_version})"
+}
+convert_relationships_parentheses() {
+  # Formats versions to work with Debian control file
+  # Adds new_depends for control file (only runs when --nocommas isn't set for run_dependency_conversion())
+  for i in new_depends new_optdepends new_conflicts new_makedepends new_checkdepends new_provides new_replaces; do
+    export ${i}="$(eval echo \${$i} | sed 's|(| (|g' | sed -E 's/[<>=][<>=]|[<>=]/& /g')"
+  done
+}
+convert_dependencies() {
+    if [[ "${depends}" == "" ]] && \
+        [[ "${optdepends}" == "" ]] && \
+        [[ "${conflicts}" == "" ]] && \
+        [[ "${provides}" == "" ]] && \
+        [[ "${replaces}" == "" ]] && \
+        [[ "${makedepends}" == "" ]] && \
+        [[ "${checkdepends}" == "" ]]; then
+        true
+    else
+
+        if [[ "${in_fakeroot}" != "true" ]]; then
+            msg "Attempting to convert dependencies..."
+        else
+            true
+        fi
+
+        new_depends=${depends[@]}
+        new_optdepends=${new_optdepends[@]}
+        new_conflicts=${conflicts[@]}
+        new_provides=${provides[@]}
+        new_makedepends=${makedepends[@]}
+        new_checkdepends=${checkdepends[@]}
+
+        # Pipe explanation:
+        # 1. Run 'makedeb-db' with dependencies specified in PKGBUILD
+        # 2. Run 'jq' to format with newlines
+        # 3. Remove '{', '}', '"', and ',' from the output
+        # 4. Replace ': ' with '='
+        # 5. Run 'xargs' to format with single spacing
+        for pkg in $(makedeb-db --general ${new_depends} ${new_optdepends} ${new_conflicts} ${new_makedepends} ${new_checkdepends} | jq | sed 's|[{}",]||g' | sed 's|: |=|g' | xargs); do
+            string1=$(echo "${pkg}" | awk -F= '{print $1}')
+            string2="$(echo "${pkg}" | awk -F= '{print $2}')"
+
+            new_depends=$(echo ${new_depends[@]} | sed "s/${string1}/${string2}/g")
+            new_optdepends=$(echo ${new_optdepends[@]} | sed "s/${string1}/${string2}/g")
+            new_conflicts=$(echo ${new_conflicts[@]} | sed "s/${string1}/${string2}/g")
+            new_provides=$(echo ${new_provides[@]} | sed "s/${string1}/${string2}/g")
+            new_makedepends=$(echo ${new_makedepends[@]} | sed "s/${string1}/${string2}/g")
+            new_checkdepends=$(echo ${new_checkdepends[@]} | sed "s/${string1}/${string2}/g")
+        done
+    fi
+}
+add_dependency_commas() {
+  new_depends=$(echo ${new_depends[@]} | sed 's| |, |g')
+  new_optdepends=$(echo ${new_optdepends[@]} | sed 's| |, |g')
+  new_conflicts=$(echo ${new_conflicts[@]} | sed 's| |, |g')
+  new_provides=$(echo ${new_provides[@]} | sed 's| |, |g')
+  new_replaces=$(echo ${new_replaces[@]} | sed 's| |, |g')
+
+  new_license="$(echo ${new_license[@]} | sed 's| |, |g')"
+}
+modify_dependencies() {
+         # Pipe explanation:
+         # 1. Read package databse with 'cat'
+         # 2. Append a semicolon(;) to the end of each line
+         # 3. Put everything onto one line with 'xargs'
+         # 4. Remove everything after first occurance of '# General dependencies'
+         # 5. Correct formatting by replacing semicolons(;) with newlines(\n)
+  source <(cat "${DATABASE_DIR}"/packages.db | sed 's|$|;|g' | xargs | sed 's|# General dependencies.*||' | sed 's|;|\n|g')
+
+  temp_pkgname=$(echo ${pkgname} | sed 's|-|_|g')
+  if [[ $(type -t ${temp_pkgname}) == "function" ]]; then
+    msg "Setting package-specific dependencies..."
+    "${temp_pkgname}"
+    for i in depends optdepends conflicts provides replaces makedepends checkdepends; do
+      "${temp_pkgname}"
+
+      # Remove dependencies
+      if [[ $(eval echo \${remove_${i}}) != "" ]]; then
+        for j in $(eval echo \${remove_${i}[@]}); do
+          eval export new_${i}=$(eval echo \\\${new_${i}//${j}})
+        done
+      fi
+
+      # Add Dependencies
+      if [[ $(eval echo \${add_${i}}) != "" ]]; then
+        export new_${i}="$(eval echo "\${new_${i}[@]} \${add_${i}[@]}")"
+      fi
+
+    done
+    unset "${temp_pkgname}"
+  fi
+}
+check_relationships() {
+    unset temp_${1}
+    for i in ${@: 2}; do
+        if echo "${i}" | grep -E '<|<=|=|>=|>' &> /dev/null; then
+
+            # Check what kind of dependency relationship symbol is used
+            for j in '<=' '>=' '<' '>' '='; do
+                if echo "${i}" | grep "${j}" &> /dev/null; then
+                    export symbol_type="${j}"
+                    # Check if $symbol_type is '<' or '>'
+                    if [[ "$(echo "${symbol_type}" | wc -c)" == "2" && "$(echo "${symbol_type}" | grep -Evw '<|>')" == "" ]]; then
+                        export old_symbol_type="${j}"
+                        export symbol_type+="${j}"
+                    else
+                        export old_symbol_type="${symbol_type}"
+                    fi
+
+                    break
+                fi
+            done
+
+            # Get values from left and right of symbol (package name and package version)
+            export local package_name=$(echo "${i}" | awk -F "${old_symbol_type}" '{print $1}')
+            export local package_version=$(echo "${i}" | awk -F "${old_symbol_type}" '{print $2}')
+
+            # Add parenthesis if dependency has a relationship
+            local dependency_name=$(echo "${package_name}(${symbol_type}${package_version})")
+            export temp_${1}+="'${dependency_name}' "
+
+        else
+            export temp_${1}+="'${i}' "
+
+        fi
+
+    done
+
+    export ${1}="$(eval echo \${temp_$1})"
+}
+convert_version() {
+    [[ "${epoch}" != "" ]] && epoch_status="${epoch}:"
+
+    if [[ "$(type -t pkgver)" == "function" ]]; then
+        export built_archive_version="${epoch_status}$(pkgver)-${pkgrel}"
+		# We use 'dpkg-name' to generate the filename for the built .deb package.
+		# Currently, 'dpkg-name' excludes the epoch from the version, so we
+		# exclude it here.
+		export build_deb_version="$(pkgver)-${pkgrel}"
+        export pkgbuild_version="${epoch_status}${pkgver}-${pkgrel}"
+    else
+        export built_archive_version="${epoch_status}${pkgver}-${pkgrel}"
+		export built_deb_version="${pkgver}-${pkgrel}"
+        export pkgbuild_version="${epoch_status}${pkgver}-${pkgrel}"
+    fi
+
+}
+convert_arch() {
+    msg "Converting architecure..."
+
+    if [[ "${arch}" == "any" ]]; then
+        export makedeb_arch="all"
+        export makepkg_arch="any"
+        export package_extension="pkg.tar.zst"
+
+    else
+        export makepkg_arch="$(uname -m)"
+
+        if [[ "${makepkg_arch}" == "x86_64" ]]; then
+            export makedeb_arch="amd64"
+            export package_extension="pkg.tar.zst"
+
+        elif [[ "${makepkg_arch}" == "armv7l" ]]; then
+            export CARCH="armv7h"
+            export makepkg_arch="armv7h"
+            export makedeb_arch="armhf"
+
+            if [[ "${target_os}" == "debian" ]]; then
+                export package_extension="pkg.tar.zst"
+            elif [[ "${target_os}" == "arch" ]]; then
+                export package_extension="pkg.tar.xz"
+            fi
+
+        elif [[ "${makepkg_arch}" == "aarch64" ]]; then
+            export CARCH="aarch64"
+            export makepkg_arch="aarch64"
+            export makedeb_arch="arm64"
+
+            if [[ "${target_os}" == "debian" ]]; then
+                export package_extension="pkg.tar.zst"
+            elif [[ "${target_os}" == "arch" ]]; then
+                export package_extension="pkg.tar.xz"
+            fi
+
+        elif [[ "${makepkg_arch}" == "armv6l" ]]; then
+            export CARCH="armv6l"
+            export makepkg_arch="armv6l"
+            export makedeb_arch="armhf"
+
+            if [[ "${target_os}" == "debian" ]]; then
+                export package_extension="pkg.tar.zst"
+            elif [[ "${target_os}" == "arch" ]]; then
+                export package_extension="pkg.tar.xz"
+            fi
+        fi
+    fi
+}
+remove_depends() {
+  if [[ "${apt_package_dependencies}" != "" ]]; then
+    msg "Removing build dependencies..."
+
+    eval sudo apt purge ${apt_package_dependencies}
+  fi
+}
+help() {
+    if [[ "${target_os}" == "debian" ]]; then
+        echo "makedeb (${makedeb_package_version}) - Create Debian archives from PKGBUILDs"
+        echo "Usage: makedeb [options]"
+        echo
+        echo "makedeb takes PKGBUILD files and builds archives installable with APT"
+        echo
+        echo "Options:"
+		echo "  -A, --ignore-arch        Ignore errors about mismatching architectures"
+        echo "  -d, --nodeps             Skip all dependency checks"
+        echo "  -F, --file, -p           Specify a build file other than 'PKGBUILD'"
+        echo "  -h, --help               Show this help menu and exit"
+        echo "  -H, --field              Append the resulting control file with custom fields"
+        echo "  -i, --install            Automatically install package(s) after building"
+        echo "  -Q, --no-fields          Skip adding values from 'control_fields' variable in PKGBUILD to control file"
+        echo "  -v, --distro-packages    Source package relationships from distro-specific variables when they exist"
+        echo "  -V, --version            Print version information and exit"
+		echo "  -r, --rmdeps             Remove installed dependencies after building"
+        echo "  -s, --syncdeps           Install missing dependencies"
+        echo "  --verbose                Print (very) detailed logging"
+        echo
+        echo "The following options can be passed to makepkg:"
+        echo "  --printsrcinfo           Print a generated .SRCINFO file and exit"
+        echo "  --skippgpcheck           Do not verify source files against PGP signatures"
+        echo
+        echo "Report bugs at https://github.com/hwittenborn/makedeb"
+
+    elif [[ "${target_os}" == "arch" ]]; then
+        echo "makedeb (${makedeb_package_version}) - Create Debian archives from PKGBUILDs"
+        echo "Usage: makedeb [options]"
+        echo
+        echo "makedeb takes PKGBUILD files and builds archives installable with APT"
+        echo
+        echo "Options:"
+		echo "  -A, --ignore-arch    Ignore errors about mismatching architectures"
+        echo "  -F, --file, -p       Specify a build file other than 'PKGBUILD'"
+        echo "  -h, --help           Show this help menu and exit"
+        echo "  -H, --field          Append the resulting control file with custom fields"
+        echo "  -Q, --no-fields      Skip adding values from 'control_fields' variable in PKGBUILD to control file"
+        echo "  -V, --version        Print version info and exit"
+        echo "  --verbose            Print (very) detailed logging"
+        echo
+        echo "The following options can be passed to makepkg:"
+        echo "  -d, --nodeps         Skip all dependency checks"
+		echo "  -r, --rmdeps         Remove installed dependencies after building"
+        echo "  -s, --syncdeps       Install missing dependencies"
+        echo "  --printsrcinfo       Print a generated .SRCINFO file and exit"
+        echo "  --skippgpcheck       Do not verify source files against PGP signatures"
+        echo
+        echo "Report bugs at https://github.com/hwittenborn/makedeb"
+    fi
+}
+generate_control() {
+    msg2 "Generating control file..."
+    export_control "Package:" "${pkgname}"
+    export_control "Description:" "${pkgdesc}"
+    export_control "Source:" "${url}"
+    export_control "Version:" "${built_archive_version}"
+
+    export_control "Architecture:" "${makedeb_arch}"
+    export_control "License:" "${new_license}"
+
+    export_control "Maintainer:" "$(cat ../../${FILE} | grep '\# Maintainer\:' | sed 's/# Maintainer: //' | xargs | sed 's|>|>,|g' | rev | sed 's|,||' | rev)"
+
+    eval export_control "Depends:" "${new_depends[@]}"
+    eval export_control "Suggests:" "${new_optdepends[@]}"
+    eval export_control "Conflicts:" "${new_conflicts[@]}"
+    eval export_control "Provides:" "${new_provides[@]}"
+    eval export_control "Replaces:" "${new_replaces[@]}"
+    eval export_control "Breaks:" "${new_replaces[@]}"
+
+    add_extra_control_fields
+
+    echo "" >> DEBIAN/control
+}
+fakeroot_build() {
+    source "${FILE}"
+
+    mkdir "${pkgdir}"
+    pkgsetup
+    convert_version
+    for package in ${pkgname[@]}; do
+        unset depends optdepends conflicts provides replaces license
+
+        tar --force-local -xf "${package}-${built_archive_version}-${makepkg_arch}.${package_extension}" -C "${pkgdir}/${package}"
+        cd "${pkgdir}/${package}"
+        get_variables
+
+        if [[ "${distro_packages}" == "true" ]]; then
+            check_distro_dependencies &> /dev/null
+        fi
+
+        remove_dependency_description
+        run_dependency_conversion
+        generate_control
+        add_install_scripts
+
+        msg2 "Cleaning up..."
+        for i in '.BUILDINFO' '.MTREE' '.PKGINFO' '.INSTALL' '.Changelog'; do
+            rm -f "${i}" || true
+        done
+
+        # Using $pkgver instead of $built_archive_version as $pkgver is pulled from .PKGINFO in the built package
+        rm "../../${package}-${pkgver}-${makepkg_arch}.${package_extension}"
+
+        field() {
+            cat "DEBIAN/control" | grep "${1}:" | awk -F": " '{print $2}'
+        }
+
+        debname=$( echo "$(field Package)_$(field Version)_$(field Architecture)" )
+        debname_install+=" ${debname}"
+
+        cd ..
+        if find ../"${debname}.deb" &> /dev/null; then
+            warning "Built package detected. Removing..."
+            rm ../"${debname}.deb"
+        fi
+
+        msg2 "Building ${pkgname}..."
+        dpkg -b "${pkgdir}"/"${package}" >> /dev/null
+        mv "${package}".deb ../
+        dpkg-name ../"${package}".deb >> /dev/null
+        msg2 "Built ${pkgname}."
+
+        cd ..
+    done
+}
+dur_check() {
+    printf "
+ .--.                  Pacman v6.0.0 - libalpm v13.0.0
+/ _.-' .-.  .-.  .-.   Copyright (C) 2006-2021 Pacman Development Team
+\  '-. '-'  '-'  '-'   Copyright (C) 2002-2006 Judd Vinet
+ '--'
+                       This program may be freely redistributed under
+                       the terms of the GNU General Public License.
+
+"
+}
+verify_dependencies() {
+    if [[ "${1}" != "" ]]; then
+        msg "Checking build dependencies..."
+
+        local apt_output=$(eval apt-get satisfy -sq ${@} 2>&1)
+        local apt_uninstallable_packages="$(echo "${apt_output}" | \
+                                            grep -o 'Depends: .*' | \
+                                            sed 's|.*Depends: ||g' | \
+                                            sed 's| but [^ ]* is to be installed||g' | \
+                                            sed 's|$|,|g' | \
+                                            xargs |
+                                            head -c -2)" || true
+
+        if [[ "${apt_uninstallable_packages}" != "" ]]; then
+            error "The following build dependencies are missing: ${apt_uninstallable_packages}"
+            exit 1
+        fi
+
+        apt_package_dependencies="$(echo "${apt_output}" |
+                                    sed 's|$| |g' |
+                                    tr -d '\n' |
+                                    grep -o 'The following NEW packages will be installed:.*[[:digit:]] upgraded' |
+                                    sed 's|The following NEW packages will be installed:||' |
+                                    sed 's|[[:digit:]] upgraded||' |
+                                    xargs)" || true
+
+        if [[ "${apt_package_dependencies}" != "" ]]; then
+            error "The following build dependencies are missing: ${apt_package_dependencies}"
+            exit 1
+        fi
+
+    fi
+}
+trap_codes() {
+  trap_int() {
+    # We're gonna put cleanup functions here later for make dependencies (and maybe other stuff)
+    error "Aborted by user. Exiting..."
+    exit 1
+  }
+
+  trap trap_int sigint
+}
+pkgsetup() {
+  for i in ${pkgname[@]}; do
+    mkdir -p "${pkgdir}"/"${i}"/DEBIAN/
+    touch "${pkgdir}"/"${i}"/DEBIAN/control
+  done
+}
+run_dependency_conversion() {
+    new_depends=${depends[@]}
+    new_optdepends=${optdepends[@]}
+    new_conflicts=${conflicts[@]}
+    new_provides=${provides[@]}
+    new_replaces=${replaces[@]}
+    new_makedepends=${makedepends[@]}
+    new_checkdepends=${checkdepends[@]}
+
+	new_license=${license[@]}
+
+    check_relationships new_depends      ${new_depends}
+    check_relationships new_optdepends   ${new_optdepends}
+    check_relationships new_conflicts    ${new_conflicts}
+    check_relationships new_provides     ${new_provides}
+    check_relationships new_replaces     ${new_replaces}
+    check_relationships new_makedepends  ${new_makedepends}
+    check_relationships new_checkdepends ${new_checkdepends}
+
+    # Used to skip adding commas when installing dependencies during building
+    [[ "${1}" != "--nocommas" ]] && add_dependency_commas
+    convert_relationships_parentheses
+}
+remove_dependency_description() {
+    # This removes comments from optdepends(i.e. 'google-chrome: for shill users')
+    # These comments are placed as I almost deleted this a bit ago thinking
+    # it didn't have a purpose.
+    NUM=0
+    while [[ "${optdepends[$NUM]}" != "" ]]; do
+        local temp_new_optdepends+=" $(echo ${optdepends[$NUM]} | awk -F: '{print $1}')"
+        NUM=$(( ${NUM} + 1 ))
+    done
+    new_optdepends=$(echo ${temp_new_optdepends[@]} | xargs)
+}
+add_extra_control_fields_template() {
+    number=0
+    control_string="$(eval echo \${${1}[$number]})"
+
+    while [[ "${control_string}" != "" ]]; do
+
+        number="$(( "${number}" + 1 ))"
+
+        control_string_name="$(echo "${control_string}" | grep -o '^[^:]*')"
+        control_string_value="$(echo "${control_string}" | sed 's|^[^:]*: ||')"
+
+        if [[ "$(echo "${control_string}" | grep -v ':')" != "" ]]; then
+            warning "Control field '${control_string_name}' is invalid. Skipping..."
+            control_string="$(eval echo \${${1}[$number]})"
+            continue
+        fi
+
+        msg2 "Adding field '${control_string_name}' to control file..."
+        export_control "${control_string_name}:" "${control_string_value}"
+
+        control_string="$(eval echo \${${1}[$number]})"
+
+    done
+}
+
+add_extra_control_fields() {
+    if [[ "${build_file_control_fields}" == "true" && "${skip_pkgbuild_fields}" != "true" ]]; then
+        add_extra_control_fields_template "control_fields"
+    fi
+
+
+    if [[ "${extra_control_fields}" != "" ]]; then
+        add_extra_control_fields_template "extra_control_fields"
+    fi
+}
+root_check() {
+  if [[ "$(whoami)" == "root" ]]; then
+    error "Running makedeb as root is not allowed as it can cause irreversable damage to your system."
+    exit 1
+  fi
+}
+# This is used to convert grouped short options (i.e. -asdf) to
+# singular short options (i.e. -a -s -d -f)
+split_args() {
+    if echo "${1}" | grep '^-[[:alnum:]][[:alnum:]]' &> /dev/null; then
+
+        for i in $(echo "${1}" | sed 's|-||' | sed 's|.|& |g'); do
+            argument_list+=("-${i}")
+        done
+        
+    else
+        argument_list+=("${1}")
+    fi
+}
+get_variables() {
+  pkginfo="$(cat .PKGINFO)"
+
+  for i in pkgname pkgver pkgdesc url arch license provides replaces; do
+    export ${i}="$(echo "${pkginfo}" | grep "${i} =" | awk -F ' = ' '{print $2}' | xargs)"
+  done
+
+  for i in depends optdepends conflicts; do
+    local string=$(echo "${i}" | sed 's|.$||')
+    export ${i}="$(echo "${pkginfo}" | grep -w "${string} =" | awk -F ' = ' '{print $2}' | awk -F ':' '{print $1}' | xargs)"
+  done
+}
+#!/usr/bin/env bash
+
+# Copyright 2020-2021 Hunter Wittenborn <hunter@hunterwittenborn.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -e
+set -o pipefail
+
+####################
+## DEFAULT VALUES ##
+####################
+export LC_ALL="C"
+export INSTALL='FALSE'
+export FILE='PKGBUILD'
+export PREBUILT='false'
+export package_convert="false"
+
+export FUNCTIONS_DIR="./"
+export DATABASE_DIR="/usr/share/makedeb-db/"
+
+#################
+## OTHER STUFF ##
+#################
+export makedeb_package_version=5.9.5
+export makedeb_release_type=stable
+export target_os="debian"
+
+cd ./
+export files="$(ls)"
+export DIR="$(echo $PWD)"
+export srcdir="${DIR}/src/"
+export pkgdir="${DIR}/pkg/"
+
+
+####################
+##  BEGIN SCRIPT  ##
+####################
+# Get makepkg message syntax
+source "/usr/share/makepkg/util/message.sh"
+colorize
+
+
+
+
+
+
+
+
+
+
+
+
+
+trap_codes
+
+if [[ "${in_fakeroot}" ]]; then
+    eval set -- ${@}
+fi
+
+# Argument Check
+arg_number="$#"
+number=1
+while [[ "${number}" -le "${arg_number}" ]]; do
+    split_args "$(eval echo \${$number})"
+    number="$(( "${number}" + 1 ))"
+done
+
+arg_check
+
+# Jump into fakeroot_build() if we're triggering the script from inside a fakeroot in the build stage
+if [[ "${in_fakeroot}" == "true" ]]; then
+    fakeroot_build
+    exit ${?}
+fi
+
+root_check
+
+find "${FILE}" &> /dev/null || { error "Couldn't find ${FILE}"; exit 1; }
+
+source "${FILE}"
+pkgbuild_check
+convert_version
+
+msg "Making package: ${pkgbase:-$pkgname} ${pkgbuild_version} ($(date))..."
+convert_arch
+
+if [[ "${distro_packages}" == "true" ]]; then
+    check_distro_dependencies
+fi
+
+find "${pkgdir}" &> /dev/null && rm "${pkgdir}" -rf
+
+remove_dependency_description
+run_dependency_conversion --nocommas
+
+# 1. Only run if on Debian, as distros like Arch don't have APT, and when
+# '-s' option is passed.
+# 2. Same as 1, but only run when '-d' is passed.
+build_dependency_list="$(echo ${new_depends} ${new_makedepends} ${new_checkdepends} | sed "s|' |'\n|g" | sort -u | sed 's|$| |g' | tr -d '\n')" || true
+
+if [[ "${target_os}" == "debian" && "${install_dependencies}" == "true" ]]; then
+    install_depends ${build_dependency_list}
+
+elif [[ "${target_os}" == "debian" && "${skip_dependency_checks}" != "true" ]]; then
+  verify_dependencies ${build_dependency_list}
+
+fi
+
+msg "Entering fakeroot environment..."
+
+msg "Running makepkg..."
+{ makepkg -p "${FILE}" ${makepkg_options}; } | grep -Ev 'Making package|Checking.*dependencies|fakeroot environment|Finished making|\.PKGINFO|\.BUILDINFO|\.MTREE'
+
+rm "${pkgdir}" -r
+
+export in_fakeroot="true"
+fakeroot -- bash ${BASH_SOURCE[0]} ${@@Q}
+
+if [[ "${target_os}" == "debian" && "${install_dependencies}" == "true" && "${remove_dependencies}" == "true" ]]; then
+    remove_depends
+fi
+
+if [[ "${target_os}" == "debian" ]] && [[ ${INSTALL} == "TRUE" ]]; then
+
+	convert_version &> /dev/null
+
+    for i in ${pkgname[@]}; do
+        apt_install+="./${i}_${built_deb_version}_${makedeb_arch}.deb "
+    done
+
+    msg "Installing $(echo "${apt_install}" | sed 's|\./||g' | sed 's| | ,|g' | rev | sed 's|, ||' | rev)..."
+    sudo apt install ${apt_install}
+fi

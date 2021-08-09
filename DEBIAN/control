@@ -1,0 +1,10 @@
+Package: makedeb
+Description: Create Debian archives from PKGBUILDs (stable release)
+Source: https://github.com/makedeb/makedeb
+Version: 5.9.5-1
+Architecture: all
+License: GPL3
+Maintainer: Maksym Titenko: <titenko.m@gmail.com>
+Depends: bash, binutils, file, dpkg-dev, makepkg
+Suggests: apt, git
+
