@@ -7,8 +7,7 @@ makedeb takes PKGBUILD files and creates Debian packages installable with APT
 
 ## Depends: 
 
-sudo apt install -y bash, binutils, file, dpkg-dev, makepkg
-
+    sudo apt install -y bash binutils file dpkg-dev makepkg
 
 ## Options:
 
