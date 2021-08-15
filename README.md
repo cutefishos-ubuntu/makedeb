@@ -9,6 +9,26 @@ makedeb takes PKGBUILD files and creates Debian packages installable with APT
 
     sudo apt install -y bash binutils file dpkg-dev makepkg
 
+## Setup
+
+**Repository Configuration**
+
+First, add the signing key:
+
+    wget -qO - 'https://proget.hunterwittenborn.com/debian-feeds/makedeb.pub' | gpg --dearmor | sudo tee /usr/share/keyrings/makedeb-archive-keyring.gpg &> /dev/null
+
+Next, add the repository information to your system:
+
+    echo 'deb [signed-by=/usr/share/keyrings/makedeb-archive-keyring.gpg arch=all] https://proget.hunterwittenborn.com/ makedeb main' | sudo tee /etc/apt/sources.list.d/makedeb.list
+
+Lastly, update the repository cache on your system:
+
+    sudo apt update
+
+The stable release is downloadable from the `makedeb` package:
+
+    sudo apt install makedeb
+
 ## Options:
 
       -A, --ignore-arch        Ignore errors about mismatching architectures
