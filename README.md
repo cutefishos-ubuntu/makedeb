@@ -9,7 +9,7 @@ makedeb takes PKGBUILD files and creates Debian packages installable with APT
 
     sudo apt install -y bash binutils file dpkg-dev makepkg
 
-## Setup
+## Setup:
 
 **Repository Configuration**
 
